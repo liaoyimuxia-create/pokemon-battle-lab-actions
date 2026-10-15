@@ -150,7 +150,7 @@ jobs:
           BEST_OF: ${{ inputs.best_of }}
           DIAGNOSTICS: ${{ inputs.diagnostics }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail  # the runner adds -e; keep going so the exit code is recorded
           case "$SCRIPT" in tier_match.py|halving_tier_match.py|deepalloc_tier_match.py) ;; *) echo "Unsupported entry script" >&2; exit 2 ;; esac
           mkdir -p logs/tier_match/actions
           extra=()
@@ -247,7 +247,7 @@ jobs:
           BEST_OF: ${{ inputs.best_of }}
           RUN_DIR: results/${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail  # the runner adds -e; keep going so the exit code is recorded
           case "$SCRIPT" in tier_match.py|halving_tier_match.py|deepalloc_tier_match.py) ;; *) echo "Unsupported entry script" >&2; exit 2 ;; esac
           mkdir -p lab/logs/tier_match/actions
           for d in "results-repo/$RUN_DIR"/shard-*; do

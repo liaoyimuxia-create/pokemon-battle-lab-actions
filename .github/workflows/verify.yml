@@ -150,7 +150,7 @@ jobs:
           rm -rf lab/vendor/pokemon-showdown
           mkdir -p lab/vendor
           cp -a showdown-build lab/vendor/pokemon-showdown
-          python -m pip install --quiet psutil
+          python -m pip install --quiet psutil pyyaml
 
       - name: Run checks (output kept private)
         id: run
@@ -164,7 +164,7 @@ jobs:
           SHARDS: ${{ needs.prepare.outputs.shards }}
           TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail  # the runner adds -e; keep going so the exit code is recorded
           out=logs/actions_verify/shard-$SHARD
           mkdir -p "$out"
           [[ -f scripts/actions_verify.py ]] || { echo "scripts/actions_verify.py is missing at this ref"; echo "exit=missing_tool" >> "$GITHUB_OUTPUT"; exit 0; }
@@ -251,7 +251,7 @@ jobs:
           SHARDS: ${{ needs.prepare.outputs.shards }}
           REF: ${{ inputs.ref }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail  # the runner adds -e; a failed merge must still push its log
           mkdir -p "results-repo/$RUN_DIR"
           python -X utf8 lab/scripts/actions_verify.py merge "results-repo/$RUN_DIR" > merge.log 2>&1
           echo "merge exit code $?; $(grep -E '^shards=[0-9]+ missing=[0-9]+ items=[0-9]+ pass=[0-9]+ fail=[0-9]+ timeout=[0-9]+$' merge.log || echo 'no count line')"
