@@ -1,0 +1,272 @@
+name: Verify (private code, summary only)
+
+# Runs checks of the private repository on public runners. Like tier_match.yml, nothing from
+# the private repository is printed or uploaded here: each shard pushes summary.json and the
+# full logs to the private branch actions-results (results/<run_id>-<attempt>/verify-shard-K/),
+# and the report job merges them into results/<run_id>-<attempt>/summary.json.
+# Read the result on the PC with: python -X utf8 scripts/actions_verify.py fetch <run_id>
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: all = every tests/test_*.py, modules = listed unittest modules, node = listed tests/*.cjs, script = one scripts/*.py
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - modules
+          - node
+          - script
+      targets:
+        description: Space-separated names (test_x / x.cjs / x.py); empty for all
+        required: false
+        default: ""
+        type: string
+      args:
+        description: Arguments for suite script ({out} = this shard's private output folder)
+        required: false
+        default: ""
+        type: string
+      shards:
+        description: Number of parallel shards (1-16; script uses 1)
+        required: true
+        default: "4"
+        type: string
+      timeout_minutes:
+        description: Per-job timeout in minutes (5-350)
+        required: true
+        default: "60"
+        type: string
+      ref:
+        description: Branch or commit of the private repository to check
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PRIVATE_REPO: liaoyimuxia-create/pokemon-battle-lab
+  RESULTS_BRANCH: actions-results
+
+jobs:
+  prepare:
+    name: Validate inputs
+    runs-on: ubuntu-24.04
+    outputs:
+      shard_matrix: ${{ steps.inputs.outputs.shard_matrix }}
+      shards: ${{ steps.inputs.outputs.shards }}
+    steps:
+      - id: inputs
+        name: Validate inputs and make shard matrix
+        shell: bash
+        env:
+          SUITE: ${{ inputs.suite }}
+          TARGETS: ${{ inputs.targets }}
+          ARGS: ${{ inputs.args }}
+          SHARDS: ${{ inputs.shards }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          REF: ${{ inputs.ref }}
+          HAS_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          [[ "$HAS_TOKEN" == "true" ]] || { echo "Secret PRIVATE_REPO_TOKEN is not set" >&2; exit 1; }
+          for name in SHARDS TIMEOUT_MINUTES; do
+            value=${!name}
+            [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "$name must be a positive integer" >&2; exit 1; }
+          done
+          (( SHARDS <= 16 )) || { echo "SHARDS must be at most 16" >&2; exit 1; }
+          (( TIMEOUT_MINUTES <= 350 )) || { echo "TIMEOUT_MINUTES must be at most 350" >&2; exit 1; }
+          (( TIMEOUT_MINUTES >= 5 )) || { echo "TIMEOUT_MINUTES must be at least 5" >&2; exit 1; }
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
+          [[ "$TARGETS" =~ ^[A-Za-z0-9_.\ ]*$ ]] || { echo "targets have unsupported characters" >&2; exit 1; }
+          [[ "$ARGS" =~ ^[A-Za-z0-9\ ._/=:,{}#+-]*$ ]] || { echo "args have unsupported characters" >&2; exit 1; }
+          [[ "$SUITE" == "script" ]] && SHARDS=1
+          matrix=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["SHARDS"])))))')
+          echo "shard_matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
+
+  shard:
+    name: verify ${{ matrix.shard }}/${{ needs.prepare.outputs.shards }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.shard_matrix) }}
+    steps:
+      - name: Check out private code and data
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: lab
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Read pinned Showdown commit
+        id: lock
+        shell: bash
+        working-directory: lab
+        run: echo "commit=$(python -c "import json; print(json.load(open('showdown.lock.json', encoding='utf-8'))['commit'])")" >> "$GITHUB_OUTPUT"
+
+      # Showdown is public code; caching its build saves about a minute per shard.
+      - name: Restore Showdown build
+        id: showdown-cache
+        uses: actions/cache@v4
+        with:
+          path: showdown-build
+          key: showdown-${{ steps.lock.outputs.commit }}-node22
+
+      - name: Fetch and build pinned Showdown
+        if: steps.showdown-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          COMMIT: ${{ steps.lock.outputs.commit }}
+        run: |
+          set -euo pipefail
+          repository=$(python -c "import json; print(json.load(open('lab/showdown.lock.json', encoding='utf-8'))['repository'])")
+          git clone --quiet --filter=blob:none "$repository" showdown-build
+          git -C showdown-build checkout --quiet --detach "$COMMIT"
+          npm --prefix showdown-build ci --silent > /dev/null
+          npm --prefix showdown-build run build --silent > /dev/null
+          git -C showdown-build diff --quiet --exit-code
+
+      - name: Place Showdown and install psutil
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf lab/vendor/pokemon-showdown
+          mkdir -p lab/vendor
+          cp -a showdown-build lab/vendor/pokemon-showdown
+          python -m pip install --quiet psutil
+
+      - name: Run checks (output kept private)
+        id: run
+        shell: bash
+        working-directory: lab
+        env:
+          SUITE: ${{ inputs.suite }}
+          TARGETS: ${{ inputs.targets }}
+          ARGS: ${{ inputs.args }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ needs.prepare.outputs.shards }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        run: |
+          set -uo pipefail
+          out=logs/actions_verify/shard-$SHARD
+          mkdir -p "$out"
+          [[ -f scripts/actions_verify.py ]] || { echo "scripts/actions_verify.py is missing at this ref"; echo "exit=missing_tool" >> "$GITHUB_OUTPUT"; exit 0; }
+          python -X utf8 scripts/actions_verify.py run --suite "$SUITE" --targets "$TARGETS" --args "$ARGS" \
+            --shard "$SHARD/$SHARDS" --out "$out" --module-timeout $(( TIMEOUT_MINUTES * 60 - 120 )) \
+            > "$out/console.log" 2>&1
+          code=$?
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          echo "shard $SHARD finished with exit code $code; $(tail -n 1 "$out/console.log" | grep -E '^items=[0-9]+ pass=[0-9]+ fail=[0-9]+ timeout=[0-9]+$' || echo 'no count line')"
+          exit 0
+
+      - name: Check out private results branch
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.RESULTS_BRANCH }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: results-repo
+
+      - name: Push shard output to the private repository
+        if: always()
+        shell: bash
+        working-directory: results-repo
+        env:
+          DEST: results/${{ github.run_id }}-${{ github.run_attempt }}/verify-shard-${{ matrix.shard }}
+          EXIT_CODE: ${{ steps.run.outputs.exit }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          src="../lab/logs/actions_verify/shard-$SHARD"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p "$DEST"
+          if [[ -d "$src" ]]; then cp -r "$src"/. "$DEST/"; fi
+          echo "${EXIT_CODE:-not_run}" > "$DEST/exit_code.txt"
+          git add -A
+          git commit --quiet -m "Verify output $DEST"
+          for attempt in 1 2 3 4 5 6; do
+            if git push --quiet origin "HEAD:$RESULTS_BRANCH"; then exit 0; fi
+            sleep $((attempt * 3))
+            git pull --quiet --rebase origin "$RESULTS_BRANCH" || true
+          done
+          echo "could not push shard output" >&2
+          exit 1
+
+      - name: Fail the job when checks failed
+        if: steps.run.outputs.exit != '0'
+        run: exit 1
+
+  report:
+    name: Merge summaries
+    needs: [prepare, shard]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out private code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: lab
+
+      - name: Check out private results
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.RESULTS_BRANCH }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: results-repo
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Merge and push summary (kept private)
+        shell: bash
+        env:
+          RUN_DIR: results/${{ github.run_id }}-${{ github.run_attempt }}
+          SUITE: ${{ inputs.suite }}
+          TARGETS: ${{ inputs.targets }}
+          ARGS: ${{ inputs.args }}
+          SHARDS: ${{ needs.prepare.outputs.shards }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -uo pipefail
+          mkdir -p "results-repo/$RUN_DIR"
+          python -X utf8 lab/scripts/actions_verify.py merge "results-repo/$RUN_DIR" > merge.log 2>&1
+          echo "merge exit code $?; $(grep -E '^shards=[0-9]+ missing=[0-9]+ items=[0-9]+ pass=[0-9]+ fail=[0-9]+ timeout=[0-9]+$' merge.log || echo 'no count line')"
+          printf '%s\n' "workflow=verify.yml" "suite=$SUITE" "targets=$TARGETS" "args=$ARGS" "shards=$SHARDS" \
+            "ref=$REF" "private_commit=$(git -C lab rev-parse HEAD)" > "results-repo/$RUN_DIR/inputs.txt"
+          cp merge.log "results-repo/$RUN_DIR/merge.log"
+          cd results-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit --quiet -m "Verify summary $RUN_DIR" || { echo "nothing to commit"; exit 0; }
+          for attempt in 1 2 3 4 5 6; do
+            if git push --quiet origin "HEAD:$RESULTS_BRANCH"; then exit 0; fi
+            sleep $((attempt * 3))
+            git pull --quiet --rebase origin "$RESULTS_BRANCH" || true
+          done
+          echo "could not push summary" >&2
+          exit 1
