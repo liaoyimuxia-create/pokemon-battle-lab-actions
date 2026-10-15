@@ -48,6 +48,11 @@ on:
           - tier_match.py
           - halving_tier_match.py
           - deepalloc_tier_match.py
+      diagnostics:
+        description: Save per-decision diagnostics (needed by halving/deepalloc summaries)
+        required: false
+        default: false
+        type: boolean
       ref:
         description: Branch or commit of the private repository to run
         required: true
@@ -143,10 +148,13 @@ jobs:
           SHARDS: ${{ inputs.shards }}
           LIMIT_PAIRS: ${{ inputs.limit_pairs }}
           BEST_OF: ${{ inputs.best_of }}
+          DIAGNOSTICS: ${{ inputs.diagnostics }}
         run: |
           set -uo pipefail
           case "$SCRIPT" in tier_match.py|halving_tier_match.py|deepalloc_tier_match.py) ;; *) echo "Unsupported entry script" >&2; exit 2 ;; esac
           mkdir -p logs/tier_match/actions
+          extra=()
+          [[ "$DIAGNOSTICS" == "true" ]] && extra+=(--diagnostics)
           python -X utf8 "scripts/$SCRIPT" \
             --challenger "$CHALLENGER" \
             --defender "$DEFENDER" \
@@ -154,6 +162,7 @@ jobs:
             --shard "$SHARD/$SHARDS" \
             --limit-pairs "$LIMIT_PAIRS" \
             --best-of "$BEST_OF" \
+            "${extra[@]}" \
             > "logs/tier_match/actions/console-shard$SHARD.log" 2>&1
           code=$?
           echo "exit=$code" >> "$GITHUB_OUTPUT"
