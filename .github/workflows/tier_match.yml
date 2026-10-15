@@ -1,0 +1,282 @@
+name: Tier match (private code and data)
+
+# This public repository holds only this workflow. The battle code and data stay in the
+# private repository: each job checks it out with the PRIVATE_REPO_TOKEN secret, runs the
+# match, and pushes the results back to the private repository (branch actions-results).
+# Nothing from the private repository is uploaded as an artifact or printed to the log,
+# because artifacts and logs of a public repository are readable by anyone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      challenger:
+        description: Challenger tier name
+        required: true
+        default: peer-v8-deep
+        type: string
+      defender:
+        description: Defender tier name
+        required: true
+        default: peer-v8
+        type: string
+      shards:
+        description: Number of parallel shards (1-16)
+        required: true
+        default: "1"
+        type: string
+      limit_pairs:
+        description: Number of team pairs
+        required: true
+        default: "1"
+        type: string
+      best_of:
+        description: Games per match upper bound
+        required: true
+        default: "1"
+        type: string
+      timeout_minutes:
+        description: Per-job timeout in minutes (1-350)
+        required: true
+        default: "60"
+        type: string
+      script:
+        description: Entry script
+        required: true
+        default: tier_match.py
+        type: choice
+        options:
+          - tier_match.py
+          - halving_tier_match.py
+          - deepalloc_tier_match.py
+      ref:
+        description: Branch or commit of the private repository to run
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PRIVATE_REPO: liaoyimuxia-create/pokemon-battle-lab
+  RESULTS_BRANCH: actions-results
+
+jobs:
+  prepare:
+    name: Validate inputs
+    runs-on: ubuntu-24.04
+    outputs:
+      shard_matrix: ${{ steps.inputs.outputs.shard_matrix }}
+    steps:
+      - id: inputs
+        name: Validate inputs and make shard matrix
+        shell: bash
+        env:
+          SHARDS: ${{ inputs.shards }}
+          LIMIT_PAIRS: ${{ inputs.limit_pairs }}
+          BEST_OF: ${{ inputs.best_of }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          REF: ${{ inputs.ref }}
+          HAS_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          [[ "$HAS_TOKEN" == "true" ]] || { echo "Secret PRIVATE_REPO_TOKEN is not set" >&2; exit 1; }
+          for name in SHARDS LIMIT_PAIRS BEST_OF TIMEOUT_MINUTES; do
+            value=${!name}
+            [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "$name must be a positive integer" >&2; exit 1; }
+          done
+          (( SHARDS <= 16 )) || { echo "SHARDS must be at most 16" >&2; exit 1; }
+          (( TIMEOUT_MINUTES <= 350 )) || { echo "TIMEOUT_MINUTES must be at most 350" >&2; exit 1; }
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
+          matrix=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["SHARDS"])))))')
+          echo "shard_matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  shard:
+    name: shard ${{ matrix.shard }}/${{ inputs.shards }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.shard_matrix) }}
+    steps:
+      - name: Check out private code and data
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: lab
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch and build pinned Showdown
+        shell: bash
+        working-directory: lab
+        run: |
+          set -euo pipefail
+          repository=$(python -c "import json; print(json.load(open('showdown.lock.json', encoding='utf-8'))['repository'])")
+          commit=$(python -c "import json; print(json.load(open('showdown.lock.json', encoding='utf-8'))['commit'])")
+          rm -rf vendor/pokemon-showdown
+          git clone --quiet --filter=blob:none "$repository" vendor/pokemon-showdown
+          git -C vendor/pokemon-showdown checkout --quiet --detach "$commit"
+          npm --prefix vendor/pokemon-showdown ci --silent > /dev/null
+          npm --prefix vendor/pokemon-showdown run build --silent > /dev/null
+          git -C vendor/pokemon-showdown diff --quiet --exit-code
+
+      - name: Run tier-match shard (output kept private)
+        id: run
+        shell: bash
+        working-directory: lab
+        env:
+          CHALLENGER: ${{ inputs.challenger }}
+          DEFENDER: ${{ inputs.defender }}
+          SCRIPT: ${{ inputs.script }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+          LIMIT_PAIRS: ${{ inputs.limit_pairs }}
+          BEST_OF: ${{ inputs.best_of }}
+        run: |
+          set -uo pipefail
+          case "$SCRIPT" in tier_match.py|halving_tier_match.py|deepalloc_tier_match.py) ;; *) echo "Unsupported entry script" >&2; exit 2 ;; esac
+          mkdir -p logs/tier_match/actions
+          python -X utf8 "scripts/$SCRIPT" \
+            --challenger "$CHALLENGER" \
+            --defender "$DEFENDER" \
+            --out logs/tier_match/actions \
+            --shard "$SHARD/$SHARDS" \
+            --limit-pairs "$LIMIT_PAIRS" \
+            --best-of "$BEST_OF" \
+            > "logs/tier_match/actions/console-shard$SHARD.log" 2>&1
+          code=$?
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          echo "shard $SHARD finished with exit code $code (console output is in the private results branch)"
+          for p in logs/tier_match/actions/decisions-deepalloc-*.jsonl; do
+            [[ -e "$p" ]] && mv "$p" "${p%.jsonl}-shard$SHARD.jsonl"
+          done
+          exit 0
+
+      - name: Check out private results branch
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.RESULTS_BRANCH }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: results-repo
+
+      - name: Push shard output to the private repository
+        if: always()
+        shell: bash
+        working-directory: results-repo
+        env:
+          DEST: results/${{ github.run_id }}-${{ github.run_attempt }}/shard-${{ matrix.shard }}
+          EXIT_CODE: ${{ steps.run.outputs.exit }}
+        run: |
+          set -euo pipefail
+          src="../lab/logs/tier_match/actions"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p "$DEST"
+          if [[ -d "$src" ]]; then cp -r "$src"/. "$DEST/"; fi
+          echo "${EXIT_CODE:-not_run}" > "$DEST/exit_code.txt"
+          git add -A
+          git commit --quiet -m "Shard output $DEST"
+          for attempt in 1 2 3 4 5 6; do
+            if git push --quiet origin "HEAD:$RESULTS_BRANCH"; then exit 0; fi
+            sleep $((attempt * 3))
+            git pull --quiet --rebase origin "$RESULTS_BRANCH" || true
+          done
+          echo "could not push shard output" >&2
+          exit 1
+
+      - name: Fail the job when the shard failed
+        if: steps.run.outputs.exit != '0'
+        run: exit 1
+
+  report:
+    name: Aggregate tier match
+    needs: [prepare, shard]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out private code
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: lab
+
+      - name: Check out private results
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.RESULTS_BRANCH }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: results-repo
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create aggregate report (kept private)
+        shell: bash
+        env:
+          CHALLENGER: ${{ inputs.challenger }}
+          DEFENDER: ${{ inputs.defender }}
+          SCRIPT: ${{ inputs.script }}
+          SHARDS: ${{ inputs.shards }}
+          LIMIT_PAIRS: ${{ inputs.limit_pairs }}
+          BEST_OF: ${{ inputs.best_of }}
+          RUN_DIR: results/${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -uo pipefail
+          case "$SCRIPT" in tier_match.py|halving_tier_match.py|deepalloc_tier_match.py) ;; *) echo "Unsupported entry script" >&2; exit 2 ;; esac
+          mkdir -p lab/logs/tier_match/actions
+          for d in "results-repo/$RUN_DIR"/shard-*; do
+            [[ -d "$d" ]] && cp "$d"/games*.jsonl lab/logs/tier_match/actions/ 2>/dev/null || true
+          done
+          cd lab
+          python -X utf8 "scripts/$SCRIPT" \
+            --challenger "$CHALLENGER" \
+            --defender "$DEFENDER" \
+            --out logs/tier_match/actions \
+            --shard "0/$SHARDS" \
+            --limit-pairs "$LIMIT_PAIRS" \
+            --best-of "$BEST_OF" \
+            --report-only > ../report-console.log 2>&1
+          echo "report exit code $?"
+          cd ..
+          mkdir -p "results-repo/$RUN_DIR"
+          cp lab/logs/tier_match/actions/report.json "results-repo/$RUN_DIR/report.json" 2>/dev/null || true
+          cp report-console.log "results-repo/$RUN_DIR/report-console.log"
+          printf '%s\n' "challenger=$CHALLENGER" "defender=$DEFENDER" "script=$SCRIPT" "shards=$SHARDS" \
+            "limit_pairs=$LIMIT_PAIRS" "best_of=$BEST_OF" "ref=${{ inputs.ref }}" \
+            "private_commit=$(git -C lab rev-parse HEAD)" > "results-repo/$RUN_DIR/inputs.txt"
+
+      - name: Push report to the private repository
+        shell: bash
+        working-directory: results-repo
+        env:
+          RUN_DIR: results/${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit --quiet -m "Report $RUN_DIR" || { echo "nothing to commit"; exit 0; }
+          for attempt in 1 2 3 4 5 6; do
+            if git push --quiet origin "HEAD:$RESULTS_BRANCH"; then exit 0; fi
+            sleep $((attempt * 3))
+            git pull --quiet --rebase origin "$RESULTS_BRANCH" || true
+          done
+          echo "could not push report" >&2
+          exit 1
