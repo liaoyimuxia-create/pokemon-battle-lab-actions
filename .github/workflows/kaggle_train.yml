@@ -1,0 +1,142 @@
+name: Kaggle train (private code and data, summary only)
+
+# Trains on Kaggle's GPU from a public runner. Nothing from the private repository is printed
+# or uploaded here: scripts/kaggle_run.py (private) builds the training data, versions a
+# PRIVATE Kaggle dataset, pushes a PRIVATE kernel, waits, and downloads its output. That output
+# and the full logs go to the private branch actions-results (results/<run_id>-<attempt>/kaggle/).
+# The Kaggle CLI reads KAGGLE_USERNAME / KAGGLE_KEY from the environment; no step prints them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      args:
+        description: Arguments for scripts/kaggle_run.py ({out} = this job's private output folder)
+        required: false
+        default: ""
+        type: string
+      timeout_minutes:
+        description: Job timeout in minutes (10-350); the script's own wait must be shorter
+        required: true
+        default: "120"
+        type: string
+      ref:
+        description: Branch or commit of the private repository
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # One Kaggle kernel slug is shared, so runs must not overlap.
+  group: kaggle-train
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: liaoyimuxia-create/pokemon-battle-lab
+  RESULTS_BRANCH: actions-results
+
+jobs:
+  train:
+    name: kaggle train
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - id: inputs
+        name: Validate inputs
+        shell: bash
+        env:
+          ARGS: ${{ inputs.args }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          REF: ${{ inputs.ref }}
+          HAS_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN != '' }}
+          HAS_KAGGLE: ${{ secrets.KAGGLE_USERNAME != '' && secrets.KAGGLE_KEY != '' }}
+        run: |
+          set -euo pipefail
+          [[ "$HAS_TOKEN" == "true" ]] || { echo "Secret PRIVATE_REPO_TOKEN is not set" >&2; exit 1; }
+          [[ "$HAS_KAGGLE" == "true" ]] || { echo "Secrets KAGGLE_USERNAME / KAGGLE_KEY are not set" >&2; exit 1; }
+          [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] || { echo "timeout_minutes must be a positive integer" >&2; exit 1; }
+          (( TIMEOUT_MINUTES >= 10 && TIMEOUT_MINUTES <= 350 )) || { echo "timeout_minutes must be 10-350" >&2; exit 1; }
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
+          [[ "$ARGS" =~ ^[A-Za-z0-9\ ._/=:,{}#+-]*$ ]] || { echo "args have unsupported characters" >&2; exit 1; }
+
+      - name: Check out private code and data
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: lab
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the Kaggle CLI
+        run: python -m pip install --quiet kaggle psutil pyyaml
+
+      - name: Run training on Kaggle (output kept private)
+        id: run
+        shell: bash
+        working-directory: lab
+        timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+        env:
+          ARGS: ${{ inputs.args }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          JOB_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set +e -uo pipefail  # the runner adds -e; keep going so the exit code is recorded
+          out=logs/kaggle_train
+          mkdir -p "$out"
+          [[ -f scripts/kaggle_run.py ]] || { echo "scripts/kaggle_run.py is missing at this ref"; echo "exit=missing_tool" >> "$GITHUB_OUTPUT"; exit 0; }
+          args=${ARGS//\{out\}/$out}
+          # shellcheck disable=SC2086
+          python -X utf8 scripts/kaggle_run.py --job-id "$JOB_ID" --out "$out" $args > "$out/console.log" 2>&1
+          code=$?
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          echo "kaggle_run finished with exit code $code"
+          exit 0
+
+      - name: Check out private results branch
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.RESULTS_BRANCH }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: results-repo
+
+      - name: Push output to the private repository
+        if: always()
+        shell: bash
+        working-directory: results-repo
+        env:
+          DEST: results/${{ github.run_id }}-${{ github.run_attempt }}/kaggle
+          EXIT_CODE: ${{ steps.run.outputs.exit }}
+          ARGS: ${{ inputs.args }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          src="../lab/logs/kaggle_train"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p "$DEST"
+          if [[ -d "$src" ]]; then cp -r "$src"/. "$DEST/"; fi
+          echo "${EXIT_CODE:-not_run}" > "$DEST/exit_code.txt"
+          printf '%s\n' "workflow=kaggle_train.yml" "args=$ARGS" "ref=$REF" \
+            "private_commit=$(git -C ../lab rev-parse HEAD 2>/dev/null || echo unknown)" > "$DEST/inputs.txt"
+          git add -A
+          git commit --quiet -m "Kaggle output $DEST"
+          for attempt in 1 2 3 4 5 6; do
+            if git push --quiet origin "HEAD:$RESULTS_BRANCH"; then exit 0; fi
+            sleep $((attempt * 3))
+            git pull --quiet --rebase origin "$RESULTS_BRANCH" || true
+          done
+          echo "could not push output" >&2
+          exit 1
+
+      - name: Fail the job when training failed
+        if: steps.run.outputs.exit != '0'
+        run: exit 1
