@@ -4,7 +4,7 @@ name: Kaggle train (private code and data, summary only)
 # or uploaded here: scripts/kaggle_run.py (private) builds the training data, versions a
 # PRIVATE Kaggle dataset, pushes a PRIVATE kernel, waits, and downloads its output. That output
 # and the full logs go to the private branch actions-results (results/<run_id>-<attempt>/kaggle/).
-# The Kaggle CLI reads KAGGLE_USERNAME / KAGGLE_KEY from the environment; no step prints them.
+# The Kaggle CLI reads KAGGLE_API_TOKEN (or KAGGLE_USERNAME / KAGGLE_KEY) from the environment; no step prints them.
 
 on:
   workflow_dispatch:
@@ -51,11 +51,11 @@ jobs:
           TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
           REF: ${{ inputs.ref }}
           HAS_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN != '' }}
-          HAS_KAGGLE: ${{ secrets.KAGGLE_USERNAME != '' && secrets.KAGGLE_KEY != '' }}
+          HAS_KAGGLE: ${{ secrets.KAGGLE_API_TOKEN != '' || (secrets.KAGGLE_USERNAME != '' && secrets.KAGGLE_KEY != '') }}
         run: |
           set -euo pipefail
           [[ "$HAS_TOKEN" == "true" ]] || { echo "Secret PRIVATE_REPO_TOKEN is not set" >&2; exit 1; }
-          [[ "$HAS_KAGGLE" == "true" ]] || { echo "Secrets KAGGLE_USERNAME / KAGGLE_KEY are not set" >&2; exit 1; }
+          [[ "$HAS_KAGGLE" == "true" ]] || { echo "Set the secret KAGGLE_API_TOKEN (or KAGGLE_USERNAME and KAGGLE_KEY)" >&2; exit 1; }
           [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] || { echo "timeout_minutes must be a positive integer" >&2; exit 1; }
           (( TIMEOUT_MINUTES >= 10 && TIMEOUT_MINUTES <= 350 )) || { echo "timeout_minutes must be 10-350" >&2; exit 1; }
           [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
@@ -85,6 +85,9 @@ jobs:
           ARGS: ${{ inputs.args }}
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          # Kaggle CLI 1.8+ authenticates with an API token ("Generate New Token" on kaggle.com).
+          # Without a KAGGLE_API_TOKEN secret, try the KAGGLE_KEY value as that token.
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN || secrets.KAGGLE_KEY }}
           JOB_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set +e -uo pipefail  # the runner adds -e; keep going so the exit code is recorded
