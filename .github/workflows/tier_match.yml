@@ -53,6 +53,11 @@ on:
         required: false
         default: false
         type: boolean
+      record_public_views:
+        description: Save each side's public view, legal choices and chosen choice per decision (gzip jsonl, private)
+        required: false
+        default: false
+        type: boolean
       ref:
         description: Branch or commit of the private repository to run
         required: true
@@ -149,12 +154,14 @@ jobs:
           LIMIT_PAIRS: ${{ inputs.limit_pairs }}
           BEST_OF: ${{ inputs.best_of }}
           DIAGNOSTICS: ${{ inputs.diagnostics }}
+          RECORD_PUBLIC_VIEWS: ${{ inputs.record_public_views }}
         run: |
           set +e -uo pipefail  # the runner adds -e; keep going so the exit code is recorded
           case "$SCRIPT" in tier_match.py|halving_tier_match.py|deepalloc_tier_match.py) ;; *) echo "Unsupported entry script" >&2; exit 2 ;; esac
           mkdir -p logs/tier_match/actions
           extra=()
           [[ "$DIAGNOSTICS" == "true" ]] && extra+=(--diagnostics)
+          [[ "$RECORD_PUBLIC_VIEWS" == "true" ]] && extra+=(--record-public-views)
           python -X utf8 "scripts/$SCRIPT" \
             --challenger "$CHALLENGER" \
             --defender "$DEFENDER" \
