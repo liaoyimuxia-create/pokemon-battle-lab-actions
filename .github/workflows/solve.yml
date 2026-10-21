@@ -81,6 +81,7 @@ jobs:
           (( SECONDS <= 600 )) || { echo "seconds_per_position must be at most 600" >&2; exit 1; }
           (( TIMEOUT_MINUTES <= 350 )) || { echo "TIMEOUT_MINUTES must be at most 350" >&2; exit 1; }
           [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
+          [[ ! "$REF" =~ ^[0-9a-f]{7,39}$ ]] || { echo "ref looks like a short commit SHA; checkout reads it as a branch name, so pass the full 40-character SHA" >&2; exit 1; }
           [[ "$SOLVER" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "solver has unsupported characters" >&2; exit 1; }
           [[ "$POSITIONS" =~ ^[A-Za-z0-9._/-]+\.jsonl$ && "$POSITIONS" != *..* ]] || { echo "positions_path must be a relative .jsonl path" >&2; exit 1; }
           matrix=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["SHARDS"])))))')

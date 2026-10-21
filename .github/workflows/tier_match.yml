@@ -116,6 +116,7 @@ jobs:
           [[ "$RUN_CONFIG" == "none" || "$SCRIPT" == "tier_match.py" ]] || { echo "run_config other than none needs tier_match.py" >&2; exit 1; }
           (( TIMEOUT_MINUTES <= 350 )) || { echo "TIMEOUT_MINUTES must be at most 350" >&2; exit 1; }
           [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
+          [[ ! "$REF" =~ ^[0-9a-f]{7,39}$ ]] || { echo "ref looks like a short commit SHA; checkout reads it as a branch name, so pass the full 40-character SHA" >&2; exit 1; }
           matrix=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["SHARDS"])))))')
           echo "shard_matrix=$matrix" >> "$GITHUB_OUTPUT"
 

@@ -59,6 +59,7 @@ jobs:
           [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] || { echo "timeout_minutes must be a positive integer" >&2; exit 1; }
           (( TIMEOUT_MINUTES >= 10 && TIMEOUT_MINUTES <= 350 )) || { echo "timeout_minutes must be 10-350" >&2; exit 1; }
           [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
+          [[ ! "$REF" =~ ^[0-9a-f]{7,39}$ ]] || { echo "ref looks like a short commit SHA; checkout reads it as a branch name, so pass the full 40-character SHA" >&2; exit 1; }
           [[ "$ARGS" =~ ^[A-Za-z0-9\ ._/=:,{}#+-]*$ ]] || { echo "args have unsupported characters" >&2; exit 1; }
 
       - name: Check out private code and data
