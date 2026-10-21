@@ -48,6 +48,12 @@ on:
           - tier_match.py
           - halving_tier_match.py
           - deepalloc_tier_match.py
+      run_config:
+        description: Team setup (none = builtin 12 teams; selfplay = train teams via --selfplay-config; pi1 = PI1 pairs via --pi1-config)
+        required: false
+        default: none
+        type: choice
+        options: [none, selfplay, pi1]
       jobs_per_shard:
         description: Games run at once inside one shard job (1-4; tier_match.py only; about 1.2GB each)
         required: false
@@ -95,6 +101,7 @@ jobs:
           REF: ${{ inputs.ref }}
           JOBS: ${{ inputs.jobs_per_shard }}
           SCRIPT: ${{ inputs.script }}
+          RUN_CONFIG: ${{ inputs.run_config }}
           HAS_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN != '' }}
         run: |
           set -euo pipefail
@@ -106,6 +113,7 @@ jobs:
           (( SHARDS <= 16 )) || { echo "SHARDS must be at most 16" >&2; exit 1; }
           [[ "$JOBS" =~ ^[1-4]$ ]] || { echo "jobs_per_shard must be 1-4" >&2; exit 1; }
           [[ "$JOBS" == "1" || "$SCRIPT" == "tier_match.py" ]] || { echo "jobs_per_shard above 1 needs tier_match.py" >&2; exit 1; }
+          [[ "$RUN_CONFIG" == "none" || "$SCRIPT" == "tier_match.py" ]] || { echo "run_config other than none needs tier_match.py" >&2; exit 1; }
           (( TIMEOUT_MINUTES <= 350 )) || { echo "TIMEOUT_MINUTES must be at most 350" >&2; exit 1; }
           [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
           matrix=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["SHARDS"])))))')
@@ -159,6 +167,7 @@ jobs:
           CHALLENGER: ${{ inputs.challenger }}
           DEFENDER: ${{ inputs.defender }}
           SCRIPT: ${{ inputs.script }}
+          RUN_CONFIG: ${{ inputs.run_config || 'none' }}
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ inputs.shards }}
           LIMIT_PAIRS: ${{ inputs.limit_pairs }}
@@ -171,6 +180,12 @@ jobs:
           case "$SCRIPT" in tier_match.py|halving_tier_match.py|deepalloc_tier_match.py) ;; *) echo "Unsupported entry script" >&2; exit 2 ;; esac
           mkdir -p logs/tier_match/actions
           extra=()
+          case "$RUN_CONFIG" in
+            none) ;;
+            selfplay) extra+=(--selfplay-config data/selfplay/run_config.json) ;;
+            pi1) extra+=(--pi1-config) ;;
+            *) echo "Unsupported run_config" >&2; exit 2 ;;
+          esac
           [[ "$DIAGNOSTICS" == "true" ]] && extra+=(--diagnostics)
           [[ "$RECORD_PUBLIC_VIEWS" == "true" ]] && extra+=(--record-public-views)
           if [[ "$JOBS" == "1" ]]; then
@@ -281,6 +296,7 @@ jobs:
           CHALLENGER: ${{ inputs.challenger }}
           DEFENDER: ${{ inputs.defender }}
           SCRIPT: ${{ inputs.script }}
+          RUN_CONFIG: ${{ inputs.run_config || 'none' }}
           SHARDS: ${{ inputs.shards }}
           LIMIT_PAIRS: ${{ inputs.limit_pairs }}
           BEST_OF: ${{ inputs.best_of }}
@@ -293,6 +309,13 @@ jobs:
             [[ -d "$d" ]] && cp "$d"/games*.jsonl lab/logs/tier_match/actions/ 2>/dev/null || true
           done
           cd lab
+          cfg=()
+          case "$RUN_CONFIG" in
+            none) ;;
+            selfplay) cfg+=(--selfplay-config data/selfplay/run_config.json) ;;
+            pi1) cfg+=(--pi1-config) ;;
+            *) echo "Unsupported run_config" >&2; exit 2 ;;
+          esac
           python -X utf8 "scripts/$SCRIPT" \
             --challenger "$CHALLENGER" \
             --defender "$DEFENDER" \
@@ -300,6 +323,7 @@ jobs:
             --shard "0/$SHARDS" \
             --limit-pairs "$LIMIT_PAIRS" \
             --best-of "$BEST_OF" \
+            "${cfg[@]}" \
             --report-only > ../report-console.log 2>&1
           echo "report exit code $?"
           cd ..
@@ -307,7 +331,7 @@ jobs:
           cp lab/logs/tier_match/actions/report.json "results-repo/$RUN_DIR/report.json" 2>/dev/null || true
           cp report-console.log "results-repo/$RUN_DIR/report-console.log"
           printf '%s\n' "challenger=$CHALLENGER" "defender=$DEFENDER" "script=$SCRIPT" "shards=$SHARDS" \
-            "limit_pairs=$LIMIT_PAIRS" "best_of=$BEST_OF" "jobs_per_shard=${{ inputs.jobs_per_shard || '1' }}" "ref=${{ inputs.ref }}" \
+            "limit_pairs=$LIMIT_PAIRS" "best_of=$BEST_OF" "jobs_per_shard=${{ inputs.jobs_per_shard || '1' }}" "run_config=$RUN_CONFIG" "ref=${{ inputs.ref }}" \
             "private_commit=$(git -C lab rev-parse HEAD)" > "results-repo/$RUN_DIR/inputs.txt"
 
       - name: Push report to the private repository
