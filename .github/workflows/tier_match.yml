@@ -48,6 +48,12 @@ on:
           - tier_match.py
           - halving_tier_match.py
           - deepalloc_tier_match.py
+      jobs_per_shard:
+        description: Games run at once inside one shard job (1-4; tier_match.py only; about 1.2GB each)
+        required: false
+        default: "1"
+        type: choice
+        options: ["1", "2", "3", "4"]
       diagnostics:
         description: Save per-decision diagnostics (needed by halving/deepalloc summaries)
         required: false
@@ -87,6 +93,8 @@ jobs:
           BEST_OF: ${{ inputs.best_of }}
           TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
           REF: ${{ inputs.ref }}
+          JOBS: ${{ inputs.jobs_per_shard }}
+          SCRIPT: ${{ inputs.script }}
           HAS_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN != '' }}
         run: |
           set -euo pipefail
@@ -96,6 +104,8 @@ jobs:
             [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "$name must be a positive integer" >&2; exit 1; }
           done
           (( SHARDS <= 16 )) || { echo "SHARDS must be at most 16" >&2; exit 1; }
+          [[ "$JOBS" =~ ^[1-4]$ ]] || { echo "jobs_per_shard must be 1-4" >&2; exit 1; }
+          [[ "$JOBS" == "1" || "$SCRIPT" == "tier_match.py" ]] || { echo "jobs_per_shard above 1 needs tier_match.py" >&2; exit 1; }
           (( TIMEOUT_MINUTES <= 350 )) || { echo "TIMEOUT_MINUTES must be at most 350" >&2; exit 1; }
           [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
           matrix=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["SHARDS"])))))')
@@ -155,6 +165,7 @@ jobs:
           BEST_OF: ${{ inputs.best_of }}
           DIAGNOSTICS: ${{ inputs.diagnostics }}
           RECORD_PUBLIC_VIEWS: ${{ inputs.record_public_views }}
+          JOBS: ${{ inputs.jobs_per_shard || '1' }}
         run: |
           set +e -uo pipefail  # the runner adds -e; keep going so the exit code is recorded
           case "$SCRIPT" in tier_match.py|halving_tier_match.py|deepalloc_tier_match.py) ;; *) echo "Unsupported entry script" >&2; exit 2 ;; esac
@@ -162,16 +173,37 @@ jobs:
           extra=()
           [[ "$DIAGNOSTICS" == "true" ]] && extra+=(--diagnostics)
           [[ "$RECORD_PUBLIC_VIEWS" == "true" ]] && extra+=(--record-public-views)
-          python -X utf8 "scripts/$SCRIPT" \
-            --challenger "$CHALLENGER" \
-            --defender "$DEFENDER" \
-            --out logs/tier_match/actions \
-            --shard "$SHARD/$SHARDS" \
-            --limit-pairs "$LIMIT_PAIRS" \
-            --best-of "$BEST_OF" \
-            "${extra[@]}" \
-            > "logs/tier_match/actions/console-shard$SHARD.log" 2>&1
-          code=$?
+          if [[ "$JOBS" == "1" ]]; then
+            python -X utf8 "scripts/$SCRIPT" \
+              --challenger "$CHALLENGER" \
+              --defender "$DEFENDER" \
+              --out logs/tier_match/actions \
+              --shard "$SHARD/$SHARDS" \
+              --limit-pairs "$LIMIT_PAIRS" \
+              --best-of "$BEST_OF" \
+              "${extra[@]}" \
+              > "logs/tier_match/actions/console-shard$SHARD.log" 2>&1
+            code=$?
+          else
+            # Split this shard into JOBS sub-shards of a SHARDS*JOBS grid and run them at once
+            # (one runner has 4 cores; one game uses about one core and 1.2GB).
+            total=$((SHARDS * JOBS)); pids=()
+            for ((i = 0; i < JOBS; i++)); do
+              sub=$((SHARD * JOBS + i))
+              python -X utf8 "scripts/$SCRIPT" \
+                --challenger "$CHALLENGER" \
+                --defender "$DEFENDER" \
+                --out logs/tier_match/actions \
+                --shard "$sub/$total" \
+                --limit-pairs "$LIMIT_PAIRS" \
+                --best-of "$BEST_OF" \
+                "${extra[@]}" \
+                > "logs/tier_match/actions/console-shard$SHARD-sub$sub.log" 2>&1 &
+              pids+=($!)
+            done
+            code=0
+            for pid in "${pids[@]}"; do wait "$pid" || code=$?; done
+          fi
           echo "exit=$code" >> "$GITHUB_OUTPUT"
           echo "shard $SHARD finished with exit code $code (console output is in the private results branch)"
           for p in logs/tier_match/actions/decisions-deepalloc-*.jsonl; do
@@ -275,7 +307,7 @@ jobs:
           cp lab/logs/tier_match/actions/report.json "results-repo/$RUN_DIR/report.json" 2>/dev/null || true
           cp report-console.log "results-repo/$RUN_DIR/report-console.log"
           printf '%s\n' "challenger=$CHALLENGER" "defender=$DEFENDER" "script=$SCRIPT" "shards=$SHARDS" \
-            "limit_pairs=$LIMIT_PAIRS" "best_of=$BEST_OF" "ref=${{ inputs.ref }}" \
+            "limit_pairs=$LIMIT_PAIRS" "best_of=$BEST_OF" "jobs_per_shard=${{ inputs.jobs_per_shard || '1' }}" "ref=${{ inputs.ref }}" \
             "private_commit=$(git -C lab rev-parse HEAD)" > "results-repo/$RUN_DIR/inputs.txt"
 
       - name: Push report to the private repository

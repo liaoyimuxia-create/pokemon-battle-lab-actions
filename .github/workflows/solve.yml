@@ -1,0 +1,197 @@
+name: Solve positions (private code and data)
+
+# Solve a fixed list of positions with a long-think solver, outside any match.
+# Same privacy rules as tier_match.yml: the private code and data are checked out with the
+# PRIVATE_REPO_TOKEN secret, and every output goes back to the private results branch.
+# Nothing is uploaded as an artifact or printed to the log of this public repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      positions_path:
+        description: Position list (jsonl) inside the private repository at ref
+        required: true
+        type: string
+      solver:
+        description: Solver tier name (for example bank-oracle-v3)
+        required: true
+        default: bank-oracle-v3
+        type: string
+      shards:
+        description: Number of parallel shards (1-16)
+        required: true
+        default: "1"
+        type: string
+      limit:
+        description: Positions per shard (0 = all)
+        required: true
+        default: "0"
+        type: string
+      seconds_per_position:
+        description: Seconds per position (1-600)
+        required: true
+        default: "600"
+        type: string
+      timeout_minutes:
+        description: Per-job timeout in minutes (1-350)
+        required: true
+        default: "120"
+        type: string
+      ref:
+        description: Branch or commit of the private repository to run
+        required: true
+        default: codex/solve-lane
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PRIVATE_REPO: liaoyimuxia-create/pokemon-battle-lab
+  RESULTS_BRANCH: actions-results
+
+jobs:
+  prepare:
+    name: Validate inputs
+    runs-on: ubuntu-24.04
+    outputs:
+      shard_matrix: ${{ steps.inputs.outputs.shard_matrix }}
+    steps:
+      - id: inputs
+        name: Validate inputs and make shard matrix
+        shell: bash
+        env:
+          POSITIONS: ${{ inputs.positions_path }}
+          SOLVER: ${{ inputs.solver }}
+          SHARDS: ${{ inputs.shards }}
+          LIMIT: ${{ inputs.limit }}
+          SECONDS: ${{ inputs.seconds_per_position }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+          REF: ${{ inputs.ref }}
+          HAS_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          [[ "$HAS_TOKEN" == "true" ]] || { echo "Secret PRIVATE_REPO_TOKEN is not set" >&2; exit 1; }
+          for name in SHARDS SECONDS TIMEOUT_MINUTES; do
+            value=${!name}
+            [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "$name must be a positive integer" >&2; exit 1; }
+          done
+          [[ "$LIMIT" =~ ^[0-9]+$ ]] || { echo "LIMIT must be a non-negative integer" >&2; exit 1; }
+          (( SHARDS <= 16 )) || { echo "SHARDS must be at most 16" >&2; exit 1; }
+          (( SECONDS <= 600 )) || { echo "seconds_per_position must be at most 600" >&2; exit 1; }
+          (( TIMEOUT_MINUTES <= 350 )) || { echo "TIMEOUT_MINUTES must be at most 350" >&2; exit 1; }
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref has unsupported characters" >&2; exit 1; }
+          [[ "$SOLVER" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "solver has unsupported characters" >&2; exit 1; }
+          [[ "$POSITIONS" =~ ^[A-Za-z0-9._/-]+\.jsonl$ && "$POSITIONS" != *..* ]] || { echo "positions_path must be a relative .jsonl path" >&2; exit 1; }
+          matrix=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["SHARDS"])))))')
+          echo "shard_matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  shard:
+    name: solve shard ${{ matrix.shard }}/${{ inputs.shards }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prepare.outputs.shard_matrix) }}
+    steps:
+      - name: Check out private code and data
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: lab
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch and build pinned Showdown
+        shell: bash
+        working-directory: lab
+        run: |
+          set -euo pipefail
+          repository=$(python -c "import json; print(json.load(open('showdown.lock.json', encoding='utf-8'))['repository'])")
+          commit=$(python -c "import json; print(json.load(open('showdown.lock.json', encoding='utf-8'))['commit'])")
+          rm -rf vendor/pokemon-showdown
+          git clone --quiet --filter=blob:none "$repository" vendor/pokemon-showdown
+          git -C vendor/pokemon-showdown checkout --quiet --detach "$commit"
+          npm --prefix vendor/pokemon-showdown ci --silent > /dev/null
+          npm --prefix vendor/pokemon-showdown run build --silent > /dev/null
+          git -C vendor/pokemon-showdown diff --quiet --exit-code
+
+      - name: Solve the positions of this shard (output kept private)
+        id: run
+        shell: bash
+        working-directory: lab
+        env:
+          POSITIONS: ${{ inputs.positions_path }}
+          SOLVER: ${{ inputs.solver }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
+          LIMIT: ${{ inputs.limit }}
+          SECONDS: ${{ inputs.seconds_per_position }}
+        run: |
+          set +e -uo pipefail  # the runner adds -e; keep going so the exit code is recorded
+          out=logs/solve/actions
+          mkdir -p "$out"
+          PYTHONPATH="src:scripts" python -X utf8 scripts/solve_positions.py run \
+            --positions "$POSITIONS" \
+            --out "$out" \
+            --shard "$SHARD/$SHARDS" \
+            --limit "$LIMIT" \
+            --seconds "$SECONDS" \
+            --tier "$SOLVER" \
+            > "$out/console-shard$SHARD.log" 2>&1
+          code=$?
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          echo "solve shard $SHARD finished with exit code $code (console output is in the private results branch)"
+          exit 0
+
+      - name: Check out private results branch
+        if: always()
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ env.RESULTS_BRANCH }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: results-repo
+
+      - name: Push shard output to the private repository
+        if: always()
+        shell: bash
+        working-directory: results-repo
+        env:
+          DEST: results/${{ github.run_id }}-${{ github.run_attempt }}/solve-shard-${{ matrix.shard }}
+          EXIT_CODE: ${{ steps.run.outputs.exit }}
+          RUN_INPUTS: >-
+            positions_path=${{ inputs.positions_path }} solver=${{ inputs.solver }} shards=${{ inputs.shards }}
+            limit=${{ inputs.limit }} seconds_per_position=${{ inputs.seconds_per_position }} ref=${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          src="../lab/logs/solve/actions"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p "$DEST"
+          if [[ -d "$src" ]]; then cp -r "$src"/. "$DEST/"; fi
+          echo "${EXIT_CODE:-not_run}" > "$DEST/exit_code.txt"
+          { echo "$RUN_INPUTS" | tr ' ' '\n'; echo "private_commit=$(git -C ../lab rev-parse HEAD)"; } > "$DEST/inputs.txt"
+          git add -A
+          git commit --quiet -m "Solve shard output $DEST"
+          for attempt in 1 2 3 4 5 6; do
+            if git push --quiet origin "HEAD:$RESULTS_BRANCH"; then exit 0; fi
+            sleep $((attempt * 3))
+            git pull --quiet --rebase origin "$RESULTS_BRANCH" || true
+          done
+          echo "could not push shard output" >&2
+          exit 1
+
+      - name: Fail the job when the shard failed
+        if: steps.run.outputs.exit != '0'
+        run: exit 1
